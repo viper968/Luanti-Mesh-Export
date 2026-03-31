@@ -2,6 +2,8 @@
 
 if any issues are found with exports please report it with what is seen, how its incorrect, what game is used, what mod the node comes from, this helps me quickly setup a world with said node to be able to easily debug what the node shows and how it gets processed, if said information isn't provided it will be difficult to debug whats wrong and how the block is pocessed
 
+usage instructions at bottom of readme.
+
 ### `export_map.py`
 Main exporter that converts Luanti `map.sqlite` world data to OBJ+MTL format for import into 3D software (Blender, etc.).
 
@@ -152,17 +154,21 @@ Uses `FACEDIR_TO_TILE_ROTATIONS` table (from Meshport) to apply per-face UV quar
 
 ## Usage
 
-### Export Command Example
-```bash
-python3 export_map.py \
-  --db map.sqlite \
-  --nodes nodes_full.lua \
-  --textures /path/to/mods \
-  --output map_export.obj \
-  --min-node -100 -100 -100 \
-  --max-node 100 100 100
-```
+Run /dumpnodes from within the world you want to export from, make sure this is done before running export_map.py
 
 ### Dump Node Definitions
 In-game: `/dumpnodes`
 Output: `<worldpath>/nodes.lua`
+
+find the path to the .minetest folder (or where ever minetest puts its games, mods, and worlds folders) and find the world you ran /dumpnodes on (world folder should contain a file named nodes.lua), input the path to the map.sqlite file inside the world folder and the nodes.lua file into the export_map.py command, for textures to work you need to point it at the folder that contains both the games folder and mods folder. --min-node and --max-node dont set the actual export limits, these just tell the script which nodeblocks to export (16x16x16 cubes) between those two node corrdinates.
+
+### Export Command Example
+```bash
+python3 export_map.py \
+  --db /path/to/minetest/world/map.sqlite \
+  --nodes /path/to/minetest/world/nodes.lua \
+  --textures /path/to/.minetest \
+  --output map_export.obj \
+  --min-node -100 -100 -100 \
+  --max-node 100 100 100
+```
