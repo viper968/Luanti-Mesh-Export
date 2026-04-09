@@ -128,9 +128,6 @@ def apply_modifier_to_base(modifier_str, base, texture_resolver):
     Apply a single modifier string to a base image.
     Modifier format: [modname:arg1:arg2:...]
     """
-    if base is None:
-        return None
-
     # Parse modifier name and arguments
     if modifier_str.startswith('['):
         modifier_str = modifier_str[1:]
@@ -141,6 +138,15 @@ def apply_modifier_to_base(modifier_str, base, texture_resolver):
 
     name = parts[0].lower()
     args = parts[1:]
+
+    # Generator modifiers create a new image without a base
+    if name == 'combine':
+        return mod_combine(args, texture_resolver)
+    elif name == 'png':
+        return mod_png(args)
+
+    if base is None:
+        return None
 
     if name == 'opacity':
         return mod_opacity(base, args)
@@ -182,14 +188,10 @@ def apply_modifier_to_base(modifier_str, base, texture_resolver):
         return mod_sheet(base, args)
     elif name == 'verticalframe':
         return mod_verticalframe(base, args)
-    elif name == 'combine':
-        return mod_combine(args, texture_resolver)
     elif name == 'crack' or name == 'cracko':
         return base
     elif name == 'inventorycube':
         return base
-    elif name == 'png':
-        return mod_png(args)
     else:
         return base
 
