@@ -91,6 +91,8 @@ Uses `FACEDIR_TO_TILE_ROTATIONS` table (from Meshport) to apply per-face UV quar
 - Sets `d` (transparency) flag in MTL when alpha min < 255
 - Supports `use_texture_alpha = "clip"` and `"blend"` modes
 
+### Extras
+- Handles empty textures properly (eg. nodecore glyphs using [combine:1x1 for the other 5 faces) 
 ---
 
 ## Map Data Handling
@@ -172,3 +174,31 @@ python3 export_map.py \
   --min-node -100 -100 -100 \
   --max-node 100 100 100
 ```
+
+# EXPERIMENTAL
+
+within the experimental folder is a testing variant of export_map.py and an accompaning blender_setup.py, the features provided by these files are still experimental and dont fully function but function enough as a proof of concept, if you would like to assist with the progression of these features please write a pull request!
+
+### Features
+- Exports a name.lights.json, this is a file containing every node that will block light and nodes that emit/pass light through them
+- blender_setup.py automaticly imports the obj+mtl and generates a light mesh utilizing the name.lights.json
+- the resulting light mesh utilizes an emission material to mimic the lighting system of minetest when rendered with cycles!
+- the light mesh is invisable to the camera when **rendering** but is visable when in mesh viewing mode
+
+### How to use blender_setup.py
+these instructions are for a linux system, i dont have blender on a windows system but if your able to run the command to export the map and the ability to install python on windows then i believe that you can figure out how to run this python script through blender!
+
+```bash
+blender --python ./experimental/blender_setup.py -- name.obj
+```
+
+this imports the obj+mtl and does the process to generate the light mesh
+
+### Issues
+- currently all light mesh calculations are single threaded so massive exports (200^3) with lots of lights (500+) will take a long time before finishing
+- the light mesh clips into the world mesh, this can be kind of fixed by increasing `SOLID_FALLOFF_RADIUS` higher, this will result in less of the light mesh being generated than normal
+- ONLY works in cycles, due to how light objects (point lights, area lights, ect) dont give the greatest light or would need hundreds of them for proper coverage this generates an emission material, downside to this is that it only functions in cycles but is alot more effecient then 400+ light objects on large exports with lots of light
+- current implementation is a bit broken as some part of the 3 step process still allows some light mesh to be generated on the other side of walls if they have air on the other side of the wall within the range of the light
+
+### Future plans
+im hoping to make this a fessible way of lighting 3D renders of exports in a way that closely ressembles luanti's own lighting system, this has taken me about a week to debug and get to the current point it is but i will be pushing another update for it soon once i get the current issues ironed out a bit more! 
