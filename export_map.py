@@ -19,6 +19,7 @@ Serialization formats:
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -489,7 +490,22 @@ class MeshExporter:
         self.texcoord_index = {}
         self._resolved_tex_cache = {}
         self._mesh_index = {}
+        self.light_sources = []
+        self.material_light_levels = {}
+        self._safe_name_map = {}
         self._build_mesh_index()
+
+    def _build_safe_name_map(self):
+        used = set()
+        for mat_name in self.materials:
+            base = re.sub(r'[^a-zA-Z0-9_]', '_', mat_name)
+            safe = base
+            counter = 0
+            while safe in used:
+                counter += 1
+                safe = f"{base}_{counter}"
+            used.add(safe)
+            self._safe_name_map[mat_name] = safe
 
     def _build_mesh_index(self):
         if not self.texture_resolver:
@@ -524,6 +540,9 @@ class MeshExporter:
             node_def = self.node_defs.get(node_name, {})
             drawtype = node_def.get('drawtype', 'normal')
             self.full_blocks[(gx, gy, gz)] = self._is_full_block(drawtype, node_def)
+            light = node_def.get('light_source', 0) or 0
+            if light > 0:
+                self.light_sources.append((gx, gy, gz, light))
 
     def _is_full_block(self, drawtype, node_def):
         if drawtype in ('normal', 'liquid', 'flowingliquid'):
@@ -549,6 +568,11 @@ class MeshExporter:
             color = name_to_color(name)
             self.materials[mat_key] = color
             self._resolve_node_texture(mat_key, name, node_info, face_idx)
+
+        node_def = self.node_defs.get(name, {})
+        light = node_def.get('light_source', 0) or 0
+        if light > 0:
+            self.material_light_levels[mat_key] = min(light, 15)
 
         return mat_key
 
@@ -1089,6 +1113,8 @@ class MeshExporter:
         obj_path = output_path.with_suffix('.obj')
         mtl_name = obj_path.with_suffix('.mtl').name
 
+        self._build_safe_name_map()
+
         total_faces = sum(len(faces) for faces in self.material_faces.values())
         print(f"\nWriting {obj_path.name}:")
         print(f"  Vertices:  {len(self.vertices)}")
@@ -1116,7 +1142,7 @@ class MeshExporter:
             for mat_name, faces in self.material_faces.items():
                 if not faces:
                     continue
-                safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', mat_name)
+                safe_name = self._safe_name_map.get(mat_name, re.sub(r'[^a-zA-Z0-9_]', '_', mat_name))
                 f.write(f"usemtl {safe_name}\n")
                 for face_str in faces:
                     f.write(f"f {face_str}\n")
@@ -1130,7 +1156,10 @@ class MeshExporter:
             f.write("# Minetest map export - Materials\n\n")
 
             for mat_name, (r, g, b) in sorted(self.materials.items()):
-                safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', mat_name)
+                safe_name = self._safe_name_map.get(mat_name, re.sub(r'[^a-zA-Z0-9_]', '_', mat_name))
+                if mat_name in self.material_light_levels:
+                    level = self.material_light_levels[mat_name]
+                    f.write(f"# LIGHT_PERMEABLE level={level}\n")
                 f.write(f"newmtl {safe_name}\n")
 
                 tex_file = self.material_textures.get(mat_name)
@@ -1168,7 +1197,6 @@ def write_v28_color_map(output_path, v28_param0_colors):
 
     print(f"\nV28 color map written to {map_path}")
     return map_path
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1291,6 +1319,9 @@ The script generates:
     print(f"  {mtl_path}")
     if v28_param0_colors:
         print(f"  {output_path.with_suffix('.v28_colors.txt')}")
+    if lights_json_path:
+        print(f"  {lights_json_path}")
+    print(f"  {output_path.with_suffix('.blender_setup.py')}")
     if exporter.material_textures:
         print(f"  textures/ ({len(exporter.material_textures)} textures resolved)")
 
