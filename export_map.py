@@ -19,7 +19,6 @@ Serialization formats:
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -490,8 +489,6 @@ class MeshExporter:
         self.texcoord_index = {}
         self._resolved_tex_cache = {}
         self._mesh_index = {}
-        self.light_sources = []
-        self.material_light_levels = {}
         self._safe_name_map = {}
         self._build_mesh_index()
 
@@ -540,9 +537,6 @@ class MeshExporter:
             node_def = self.node_defs.get(node_name, {})
             drawtype = node_def.get('drawtype', 'normal')
             self.full_blocks[(gx, gy, gz)] = self._is_full_block(drawtype, node_def)
-            light = node_def.get('light_source', 0) or 0
-            if light > 0:
-                self.light_sources.append((gx, gy, gz, light))
 
     def _is_full_block(self, drawtype, node_def):
         if drawtype in ('normal', 'liquid', 'flowingliquid'):
@@ -568,12 +562,6 @@ class MeshExporter:
             color = name_to_color(name)
             self.materials[mat_key] = color
             self._resolve_node_texture(mat_key, name, node_info, face_idx)
-
-        node_def = self.node_defs.get(name, {})
-        light = node_def.get('light_source', 0) or 0
-        if light > 0:
-            self.material_light_levels[mat_key] = min(light, 15)
-
         return mat_key
 
     def _resolve_node_texture(self, mat_key, node_name, node_info, face_idx=None):
@@ -1157,9 +1145,6 @@ class MeshExporter:
 
             for mat_name, (r, g, b) in sorted(self.materials.items()):
                 safe_name = self._safe_name_map.get(mat_name, re.sub(r'[^a-zA-Z0-9_]', '_', mat_name))
-                if mat_name in self.material_light_levels:
-                    level = self.material_light_levels[mat_name]
-                    f.write(f"# LIGHT_PERMEABLE level={level}\n")
                 f.write(f"newmtl {safe_name}\n")
 
                 tex_file = self.material_textures.get(mat_name)
@@ -1319,9 +1304,6 @@ The script generates:
     print(f"  {mtl_path}")
     if v28_param0_colors:
         print(f"  {output_path.with_suffix('.v28_colors.txt')}")
-    if lights_json_path:
-        print(f"  {lights_json_path}")
-    print(f"  {output_path.with_suffix('.blender_setup.py')}")
     if exporter.material_textures:
         print(f"  textures/ ({len(exporter.material_textures)} textures resolved)")
 
