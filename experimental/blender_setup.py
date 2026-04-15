@@ -8,7 +8,7 @@ import numpy as np
 from collections import deque
 
 ISOLEVEL = 2.0
-MAX_WATTS = 100.0
+MAX_WATTS = 0.5
 SOLID_FALLOFF_RADIUS = 2.0  # blocks — 0.5 = tight fit, 1.0 = default, 2.0 = pulled well clear of walls
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -118,71 +118,139 @@ if os.path.exists(lights_json_path):
                 queue.append((nx, ny, nz))
         print(f"\n  BFS complete: {len(reachable)} reachable cells")
 
-        # Phase 2: Euclidean scalar field with solid boundary softening
         source_list = list(sources.items())
+
+        # Phase 1b: Per-source BFS reachability
+        # Phase 1 tells us which cells are reachable from anywhere.
+        # This tells us which cells each specific source can reach without passing
+        # through walls — fixing light bleeding through solid blocks into adjacent spaces.
+        print("Phase 1b: Per-source reachability...")
+        cells_i = np.array(list(reachable), dtype=np.int32)
+        cell_to_idx = {tuple(pos): i for i, pos in enumerate(cells_i)}
+
+        reach_mask = np.zeros((len(cell_to_idx), len(source_list)), dtype=bool)
+        for s_idx, ((sx, sy, sz), level) in enumerate(source_list):
+            src_reach = {(sx, sy, sz)}
+            src_queue = deque([(sx, sy, sz, level)])
+            while src_queue:
+                cx, cy, cz, remaining = src_queue.popleft()
+                if remaining <= 1:
+                    continue
+                for ddx, ddy, ddz in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
+                    nb = (cx+ddx, cy+ddy, cz+ddz)
+                    if nb in src_reach or nb in solid_blocks:
+                        continue
+                    if not (bx[0]<=nb[0]<=bx[1] and by[0]<=nb[1]<=by[1] and bz[0]<=nb[2]<=bz[1]):
+                        continue
+                    src_reach.add(nb)
+                    src_queue.append((nb[0], nb[1], nb[2], remaining - 1))
+            for pos in src_reach:
+                if pos in cell_to_idx:
+                    reach_mask[cell_to_idx[pos], s_idx] = True
+            if s_idx % 10 == 0:
+                print(f"  Per-source BFS: {s_idx+1}/{len(source_list)} sources", end="\r")
+        print(f"\n  Per-source BFS complete")
+
+        # Phase 2: Euclidean scalar field with solid boundary softening (numpy vectorized)
         print(f"Phase 2: Euclidean field ({len(reachable)} cells, {len(source_list)} sources)...")
 
-        def box_sdf(px, py, pz, sx, sy, sz):
-            """Distance from cell centre (px,py,pz) to the face of a unit solid block at (sx,sy,sz)."""
-            dx = max(0.0, abs(px - sx) - 0.5)
-            dy = max(0.0, abs(py - sy) - 0.5)
-            dz = max(0.0, abs(pz - sz) - 0.5)
-            return math.sqrt(dx*dx + dy*dy + dz*dz)
+        # Grid dimensions and offset computed here — also used by Phase 3 arr build
+        (xmin,xmax),(ymin,ymax),(zmin,zmax) = bound_tuple
+        shape  = (xmax-xmin+3, ymax-ymin+3, zmax-zmin+3)
+        offset = (xmin-1, ymin-1, zmin-1)
 
-        field = {}
-        fi = 0
-        for pos in reachable:
-            fi += 1
-            if fi % 100 == 0:
-                print(f"  Field: {fi}/{len(reachable)} cells done", end="\r")
-            px, py, pz = pos
+        # Build 3D boolean solid grid for vectorized neighbour lookups
+        solid_arr = np.zeros(shape, dtype=bool)
+        for (x, y, z) in solid_blocks:
+            ix, iy, iz = x - offset[0], y - offset[1], z - offset[2]
+            if 0 <= ix < shape[0] and 0 <= iy < shape[1] and 0 <= iz < shape[2]:
+                solid_arr[ix, iy, iz] = True
 
-            # Light contribution summed from all sources
-            value = 0.0
-            for (sx, sy, sz), level in source_list:
-                dist = math.sqrt((px-sx)**2 + (py-sy)**2 + (pz-sz)**2)
-                contrib = level - dist
-                if contrib > 0:
-                    value += contrib
+        # ── Light contribution: fully vectorized ──────────────────────────────
+        # cells_i already built in Phase 1b
+        cells_f    = cells_i.astype(np.float32)
+        src_pos    = np.array([[x, y, z] for (x,y,z),_ in source_list], dtype=np.float32)  # (S, 3)
+        src_levels = np.array([lv for _,lv in source_list], dtype=np.float32)               # (S,)
 
-            if value <= 0:
+        # Process in chunks so peak memory stays bounded at CHUNK * S * 3 * 4 bytes
+        CHUNK  = 50_000
+        values = np.zeros(len(cells_f), dtype=np.float32)
+        for start in range(0, len(cells_f), CHUNK):
+            end   = min(start + CHUNK, len(cells_f))
+            chunk = cells_f[start:end]                              # (C, 3)
+            diff  = chunk[:, None, :] - src_pos[None, :, :]        # (C, S, 3)
+            dists = np.sqrt(np.einsum('ijk,ijk->ij', diff, diff))   # (C, S)
+            # reach_mask gates each source's contribution to only cells it can
+            # physically reach — prevents light bleeding through solid walls
+            contribs = np.maximum(0.0, src_levels[None, :] - dists)
+            contribs *= reach_mask[start:end, :]
+            values[start:end] = np.sum(contribs, axis=1)
+            print(f"  Distance field: {end}/{len(cells_f)} cells", end="\r")
+        print()
+
+        # ── Solid boundary softening: vectorized over all 26 neighbours ───────
+        lit_mask   = values > 0
+        lit_i      = cells_i[lit_mask]         # (M, 3) integer positions of lit cells
+        lit_values = values[lit_mask].copy()   # (M,)
+
+        # box_sdf(cell, cell+offset) = sqrt(sum(max(0, |d_axis|-0.5)^2))
+        # This value is CONSTANT per offset — precompute all 26 once.
+        nb_offsets = np.array(
+            [[ddx, ddy, ddz]
+             for ddx in (-1, 0, 1)
+             for ddy in (-1, 0, 1)
+             for ddz in (-1, 0, 1)
+             if not (ddx == 0 and ddy == 0 and ddz == 0)],
+            dtype=np.int32)                                         # (26, 3)
+        nb_bsdf = np.array([
+            math.sqrt(max(0.0, abs(float(d[0])) - 0.5) ** 2
+                    + max(0.0, abs(float(d[1])) - 0.5) ** 2
+                    + max(0.0, abs(float(d[2])) - 0.5) ** 2)
+            for d in nb_offsets], dtype=np.float32)                # (26,)
+
+        # Convert lit positions to array-space indices for solid_arr lookups
+        lit_arr_idx    = lit_i - np.array(offset, dtype=np.int32) # (M, 3)
+        min_solid_dist = np.full(len(lit_i), np.inf, dtype=np.float32)
+
+        for oi in range(len(nb_offsets)):
+            bsdf = float(nb_bsdf[oi])
+            if bsdf >= SOLID_FALLOFF_RADIUS:
+                continue                                            # can't improve min, skip
+            nb_idx = lit_arr_idx + nb_offsets[oi]                  # (M, 3)
+            valid  = (
+                (nb_idx[:, 0] >= 0) & (nb_idx[:, 0] < shape[0]) &
+                (nb_idx[:, 1] >= 0) & (nb_idx[:, 1] < shape[1]) &
+                (nb_idx[:, 2] >= 0) & (nb_idx[:, 2] < shape[2])
+            )
+            if not np.any(valid):
                 continue
+            is_solid_v = solid_arr[nb_idx[valid, 0], nb_idx[valid, 1], nb_idx[valid, 2]]
+            solid_here = np.zeros(len(lit_i), dtype=bool)
+            solid_here[valid] = is_solid_v
+            min_solid_dist = np.where(solid_here & (bsdf < min_solid_dist),
+                                      bsdf, min_solid_dist)
 
-            # Solid boundary softening: check all 26 immediate neighbours for solid blocks.
-            # Only neighbours within 1 cell radius can cause clipping so no wider search needed.
-            min_solid_dist = float('inf')
-            for ddx in (-1, 0, 1):
-                for ddy in (-1, 0, 1):
-                    for ddz in (-1, 0, 1):
-                        if ddx == 0 and ddy == 0 and ddz == 0:
-                            continue
-                        nb = (px + ddx, py + ddy, pz + ddz)
-                        if nb in solid_blocks:
-                            d = box_sdf(px, py, pz, nb[0], nb[1], nb[2])
-                            if d < min_solid_dist:
-                                min_solid_dist = d
+        # Linear ramp: 0 at solid face → 1 at SOLID_FALLOFF_RADIUS away
+        ramp = np.where(min_solid_dist < SOLID_FALLOFF_RADIUS,
+                        min_solid_dist / SOLID_FALLOFF_RADIUS, 1.0)
+        lit_values *= ramp
 
-            # Linear ramp: 0 at solid face → 1 at SOLID_FALLOFF_RADIUS blocks away
-            if min_solid_dist < SOLID_FALLOFF_RADIUS:
-                value *= min_solid_dist / SOLID_FALLOFF_RADIUS
-
-            if value > 0:
-                field[pos] = value
-        print(f"\n  Field complete: {len(field)} cells with light")
+        # Keep only positive cells; expose as numpy arrays for Phase 3 arr build
+        pos_mask   = lit_values > 0
+        field_pos  = lit_i[pos_mask]           # (F, 3) integer coords
+        field_vals = lit_values[pos_mask]      # (F,) float32
+        field = dict(zip(map(tuple, field_pos), field_vals.tolist()))
+        print(f"  Field complete: {len(field)} cells with light")
 
         if field:
             # Phase 3: Marching cubes
-            (xmin,xmax),(ymin,ymax),(zmin,zmax) = bound_tuple
-            shape = (xmax-xmin+3, ymax-ymin+3, zmax-zmin+3)
+            # shape and offset already computed in Phase 2; field_pos/field_vals are numpy arrays
             arr = np.zeros(shape, dtype=np.float32)
-            offset = (xmin-1, ymin-1, zmin-1)
-            for (x,y,z), v in field.items():
-                ix = x - offset[0]
-                iy = y - offset[1]
-                iz = z - offset[2]
-                arr[ix, iy, iz] = v
+            arr[field_pos[:, 0] - offset[0],
+                field_pos[:, 1] - offset[1],
+                field_pos[:, 2] - offset[2]] = field_vals
 
-            max_field_value = max(field.values())
+            max_field_value = float(field_vals.max())
             isolevel = ISOLEVEL
 
             # Marching cubes edge table (256 entries)
@@ -480,75 +548,88 @@ if os.path.exists(lights_json_path):
                 [ -1 ],
             ]
 
-            # Marching cubes interpolation
+            # Phase 3: Marching cubes (vectorized cubeindex, loop only over active boundary cubes)
+
+            # ── Vectorized cubeindex computation ─────────────────────────────
+            # Vertex bit mapping: bit n set means corner n > isolevel.
+            # Corner n encodes offsets via bits: bit0=+i, bit1=+j, bit2=+k
+            c = [
+                arr[:-1, :-1, :-1],  # v0: (i,   j,   k  )
+                arr[1:,  :-1, :-1],  # v1: (i+1, j,   k  )
+                arr[:-1, 1:,  :-1],  # v2: (i,   j+1, k  )
+                arr[1:,  1:,  :-1],  # v3: (i+1, j+1, k  )
+                arr[:-1, :-1, 1: ],  # v4: (i,   j,   k+1)
+                arr[1:,  :-1, 1: ],  # v5: (i+1, j,   k+1)
+                arr[:-1, 1:,  1: ],  # v6: (i,   j+1, k+1)
+                arr[1:,  1:,  1: ],  # v7: (i+1, j+1, k+1)
+            ]
+            cubeindex_arr = np.zeros(c[0].shape, dtype=np.int32)
+            for ci in range(8):
+                cubeindex_arr |= (c[ci] > isolevel).astype(np.int32) << ci
+
+            # Find only cubes that cross the isosurface (edge_table != 0)
+            edge_table_np = np.array(edge_table, dtype=np.int32)
+            active_ijk    = np.argwhere(edge_table_np[cubeindex_arr] != 0)  # (A, 3)
+
+            # Pre-extract all 8 corner values for every active cube at once
+            ai, aj, ak = active_ijk[:, 0], active_ijk[:, 1], active_ijk[:, 2]
+            corner_vals = np.stack([
+                arr[ai,   aj,   ak  ],
+                arr[ai+1, aj,   ak  ],
+                arr[ai,   aj+1, ak  ],
+                arr[ai+1, aj+1, ak  ],
+                arr[ai,   aj,   ak+1],
+                arr[ai+1, aj,   ak+1],
+                arr[ai,   aj+1, ak+1],
+                arr[ai+1, aj+1, ak+1],
+            ], axis=1)  # (A, 8)
+
+            edge_pairs = [
+                (0,1),(1,3),(3,2),(2,0),
+                (4,5),(5,7),(7,6),(6,4),
+                (0,4),(1,5),(3,7),(2,6),
+            ]
+
             all_verts = []
-            all_tris = []
-            all_tri_vals = []
-            nx, ny, nz = arr.shape
-            mc_total = (nx - 1) * (ny - 1) * (nz - 1)
-            mc_count = 0
-            print(f"Phase 3: Marching cubes ({mc_total} cubes to scan)...")
-            for i in range(nx - 1):
-                for j in range(ny - 1):
-                    for k in range(nz - 1):
-                        mc_count += 1
-                        if mc_count % 100 == 0:
-                            pct = mc_count * 100 // mc_total
-                            print(f"  Marching cubes: {pct}% ({len(all_verts)} verts, {len(all_tris)} tris)", end="\r")
-                        cube = [
-                            arr[i, j, k], arr[i+1, j, k], arr[i, j+1, k], arr[i+1, j+1, k],
-                            arr[i, j, k+1], arr[i+1, j, k+1], arr[i, j+1, k+1], arr[i+1, j+1, k+1],
-                        ]
-                        cubeindex = 0
-                        for ci in range(8):
-                            if cube[ci] > isolevel:
-                                cubeindex |= (1 << ci)
-                        edges = edge_table[cubeindex]
-                        if edges == 0:
-                            continue
-                        tri_list = tri_table[cubeindex]
-                        if tri_list[0] == -1:
-                            continue
+            all_tris  = []
+            total_active = len(active_ijk)
+            print(f"Phase 3: Marching cubes ({total_active} active / {cubeindex_arr.size} total cubes)...")
 
-                        # Edge vertex interpolation
-                        edge_verts = [None] * 12
-                        edge_vals = [0.0] * 12
-                        # Edge pairs match the gist convention:
-                        # 0:(0,1) 1:(1,3) 2:(3,2) 3:(2,0)
-                        # 4:(4,5) 5:(5,7) 6:(7,6) 7:(6,4)
-                        # 8:(0,4) 9:(1,5) 10:(3,7) 11:(2,6)
-                        edge_pairs = [
-                            (0,1),(1,3),(3,2),(2,0),
-                            (4,5),(5,7),(7,6),(6,4),
-                            (0,4),(1,5),(3,7),(2,6),
-                        ]
-                        for ei in range(12):
-                            if edges & (1 << ei):
-                                a, b = edge_pairs[ei]
-                                va, vb = cube[a], cube[b]
-                                if abs(vb - va) > 1e-10:
-                                    t = (isolevel - va) / (vb - va)
-                                else:
-                                    t = 0.5
-                                pa = (float(i + (a & 1)), float(j + ((a >> 1) & 1)), float(k + ((a >> 2) & 1)))
-                                pb = (float(i + (b & 1)), float(j + ((b >> 1) & 1)), float(k + ((b >> 2) & 1)))
-                                vx = pa[0] + t * (pb[0] - pa[0])
-                                vy = pa[1] + t * (pb[1] - pa[1])
-                                vz = pa[2] + t * (pb[2] - pa[2])
-                                edge_verts[ei] = (vx, vy, vz)
-                                edge_vals[ei] = va + t * (vb - va)
+            for idx_num in range(total_active):
+                if idx_num % 5000 == 0:
+                    pct = idx_num * 100 // max(total_active, 1)
+                    print(f"  Marching cubes: {pct}% ({len(all_verts)} verts)", end="\r")
 
-                        for idx in range(0, len(tri_list), 3):
-                            if idx + 2 >= len(tri_list):
-                                break
-                            e0, e1, e2 = tri_list[idx], tri_list[idx+1], tri_list[idx+2]
-                            if edge_verts[e0] is None or edge_verts[e1] is None or edge_verts[e2] is None:
-                                continue
-                            all_verts.append(edge_verts[e0])
-                            all_verts.append(edge_verts[e1])
-                            all_verts.append(edge_verts[e2])
-                            all_tris.append((len(all_verts)-3, len(all_verts)-2, len(all_verts)-1))
-                            all_tri_vals.append((edge_vals[e0], edge_vals[e1], edge_vals[e2]))
+                i, j, k  = int(active_ijk[idx_num, 0]), int(active_ijk[idx_num, 1]), int(active_ijk[idx_num, 2])
+                cube      = corner_vals[idx_num]       # (8,) pre-extracted
+                cubeindex = int(cubeindex_arr[i, j, k])
+                edges     = edge_table[cubeindex]
+                tri_list  = tri_table[cubeindex]
+                if tri_list[0] == -1:
+                    continue
+
+                edge_verts = [None] * 12
+                for ei in range(12):
+                    if edges & (1 << ei):
+                        a, b   = edge_pairs[ei]
+                        va, vb = float(cube[a]), float(cube[b])
+                        t      = (isolevel - va) / (vb - va) if abs(vb - va) > 1e-10 else 0.5
+                        vx = float(i + (a & 1))       + t * float((b & 1)       - (a & 1))
+                        vy = float(j + ((a>>1) & 1))  + t * float(((b>>1) & 1)  - ((a>>1) & 1))
+                        vz = float(k + ((a>>2) & 1))  + t * float(((b>>2) & 1)  - ((a>>2) & 1))
+                        edge_verts[ei] = (vx, vy, vz)
+
+                for tidx in range(0, len(tri_list), 3):
+                    if tidx + 2 >= len(tri_list):
+                        break
+                    e0, e1, e2 = tri_list[tidx], tri_list[tidx+1], tri_list[tidx+2]
+                    if edge_verts[e0] is None or edge_verts[e1] is None or edge_verts[e2] is None:
+                        continue
+                    base = len(all_verts)
+                    all_verts.append(edge_verts[e0])
+                    all_verts.append(edge_verts[e1])
+                    all_verts.append(edge_verts[e2])
+                    all_tris.append((base, base + 1, base + 2))
 
             if all_verts:
                 mesh = bpy.data.meshes.new("LightVolume")
