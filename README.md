@@ -34,7 +34,7 @@ Library for parsing Minetest texture modifier strings and resolving them to PIL 
 | `signlike`              | Partial | No       | No                | Single flat plane                                     |
 | `firelike`              | Partial | No       | No                | Cross-planes                                          |
 | `liquid`                | Full    | N/A      | Yes               | Full cube rendering                                   |
-| `flowingliquid`         | Full    | N/A      | Yes               | Full cube rendering                                   |
+| `flowingliquid`         | Full    | N/A      | Yes               | Proper leveled rendering (still in-progress)          |
 | `glasslike`             | Full    | N/A      | Yes               | Always shows all faces                                |
 | `allfaces`              | Full    | N/A      | Yes               | Always shows all faces                                |
 | `glasslike_framed`      | Full    | N/A      | Yes               | Always shows all faces                                |
