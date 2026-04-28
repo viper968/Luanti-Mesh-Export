@@ -26,6 +26,7 @@ import struct
 import sys
 import zlib
 from collections import defaultdict
+from multiprocessing import Pool
 from pathlib import Path
 
 try:
@@ -314,6 +315,23 @@ def deserialize_v28(data):
     return {'version': 28, 'mapping': {}, 'nodes': nodes}
 
 
+def _process_block_row(args):
+    """Module-level worker for parallel block deserialization (Pool-picklable)."""
+    bx, by, bz, blob = args
+    version, decompressed = decompress_blob(blob)
+    if decompressed is None:
+        return None
+    if version == 0x1D:
+        result = deserialize_v29(decompressed)
+    elif version == 0x1C:
+        result = deserialize_v28(decompressed)
+    else:
+        return None
+    if not result['nodes']:
+        return None
+    return (bx, by, bz, result)
+
+
 def query_blocks(db_path, min_mb, max_mb):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -330,42 +348,22 @@ def query_blocks(db_path, min_mb, max_mb):
     rows = list(cur)
     conn.close()
 
-    total = v28_count = v29_count = other_count = empty_count = 0
+    total = len(rows)
+    # Convert to plain tuples with bytes blobs — sqlite3.Row is not picklable
+    args_list = [(row['x'], row['y'], row['z'], bytes(row['data'])) for row in rows]
 
-    for row in rows:
-        bx, by, bz = row['x'], row['y'], row['z']
-        blob = row['data']
-        total += 1
+    with Pool() as pool:
+        raw_results = pool.map(_process_block_row, args_list, chunksize=64)
 
-        version, decompressed = decompress_blob(blob)
-
-        if decompressed is None:
-            other_count += 1
-            continue
-
-        if version == 0x1D:
-            result = deserialize_v29(decompressed)
-            v29_count += 1
-        elif version == 0x1C:
-            result = deserialize_v28(decompressed)
-            v28_count += 1
-        else:
-            other_count += 1
-            continue
-
-        if not result['nodes']:
-            empty_count += 1
-            continue
-
-        yield (bx, by, bz, result)
-
+    with_nodes = sum(1 for r in raw_results if r is not None)
     print(f"\nBlock statistics:")
     print(f"  Total queried: {total}")
-    print(f"  v29 blocks:    {v29_count}")
-    print(f"  v28 blocks:    {v28_count}")
-    print(f"  Unknown/other: {other_count}")
-    print(f"  Empty (air):   {empty_count}")
-    print(f"  With nodes:    {total - empty_count - other_count}")
+    print(f"  With nodes:    {with_nodes}")
+    print(f"  Empty/failed:  {total - with_nodes}")
+
+    for r in raw_results:
+        if r is not None:
+            yield r
 
 
 FACE_DIRS = [
@@ -490,6 +488,18 @@ class MeshExporter:
         self._resolved_tex_cache = {}
         self._mesh_index = {}
         self._safe_name_map = {}
+        # Numpy-backed spatial structures — built once at the start of generate_mesh.
+        # _vert_arr:         int32[x,y,z] -> 1-based OBJ vertex index (0 = unassigned).
+        # _solid_arr:        bool[x,y,z]  -> True for full solid blocks (excl. flowingliquid).
+        #                    Used by normal blocks and the fast path to cull faces.
+        # _liquid_solid_arr: bool[x,y,z]  -> True for solid + any liquid (source or flowing).
+        #                    Used by liquid blocks only so they cull faces at liquid boundaries.
+        # _arr_offset:       (ox,oy,oz)   — world_coord = array_index + offset.
+        self._vert_arr = None
+        self._solid_arr = None
+        self._liquid_solid_arr = None
+        self._arr_offset = (0, 0, 0)
+        self._arr_shape = (0, 0, 0)
         self._build_mesh_index()
 
     def _build_safe_name_map(self):
@@ -539,7 +549,7 @@ class MeshExporter:
             self.full_blocks[(gx, gy, gz)] = self._is_full_block(drawtype, node_def)
 
     def _is_full_block(self, drawtype, node_def):
-        if drawtype in ('normal', 'liquid', 'flowingliquid'):
+        if drawtype in ('normal', 'liquid'):
             return True
         return False
 
@@ -646,9 +656,25 @@ class MeshExporter:
         normal = FACE_NORMALS[face_name]
 
         vert_indices = []
-        for vx, vy, vz in quad:
-            pos = (nx + vx, ny + vy, nz + vz)
-            vert_indices.append(self.get_vert_index(pos))
+        va = self._vert_arr
+        if va is not None:
+            ox, oy, oz = self._arr_offset
+            verts = self.vertices
+            for vx, vy, vz in quad:
+                ix = nx + vx - ox
+                iy = ny + vy - oy
+                iz = nz + vz - oz
+                existing = int(va[ix, iy, iz])
+                if existing:
+                    vert_indices.append(existing)
+                else:
+                    idx = len(verts) + 1
+                    va[ix, iy, iz] = idx
+                    verts.append((nx + vx, ny + vy, nz + vz))
+                    vert_indices.append(idx)
+        else:
+            for vx, vy, vz in quad:
+                vert_indices.append(self.get_vert_index((nx + vx, ny + vy, nz + vz)))
 
         uvs = FACE_UVS[face_name]
         uv_indices = [self.get_texcoord_index((u, v)) for u, v in uvs]
@@ -760,17 +786,250 @@ class MeshExporter:
         gx, gy, gz = node_pos
         always_show = drawtype in ('glasslike', 'allfaces', 'allfaces_optional',
                                     'glasslike_framed', 'glasslike_framed_optional')
-        for face_idx, (dx, dy, dz, face_name) in enumerate(FACE_DIRS):
-            neighbor_pos = (gx + dx, gy + dy, gz + dz)
-            face_material = material_name
-            if node_info is not None:
-                face_material = self.get_material_name(node_info, face_idx)
-            if always_show:
+
+        # Precompute material for single-tile nodes — one lookup instead of up to six.
+        if node_info is not None:
+            tiles = self.node_defs.get(node_info['name'], {}).get('tiles', [])
+            multi_tile = len(tiles) > 1
+            single_mat = None if multi_tile else self.get_material_name(node_info, 0)
+        else:
+            multi_tile = False
+            single_mat = material_name
+
+        # Use solid_arr for O(1) array indexing instead of two dict lookups per face.
+        # Source liquid blocks use liquid_solid_arr so they also cull faces toward
+        # flowing liquid neighbours (avoiding a one-sided barrier face at the boundary).
+        if drawtype == 'liquid' and self._liquid_solid_arr is not None:
+            solid = self._liquid_solid_arr
+        else:
+            solid = self._solid_arr
+        if solid is not None:
+            ox, oy, oz = self._arr_offset
+            sx, sy, sz = self._arr_shape
+            aix = gx - ox
+            aiy = gy - oy
+            aiz = gz - oz
+            for face_idx, (dx, dy, dz, face_name) in enumerate(FACE_DIRS):
+                if not always_show:
+                    nix, niy, niz = aix + dx, aiy + dy, aiz + dz
+                    if (0 <= nix < sx and 0 <= niy < sy and 0 <= niz < sz
+                            and solid[nix, niy, niz]):
+                        continue
+                face_material = self.get_material_name(node_info, face_idx) if multi_tile else single_mat
                 self.emit_face(node_pos, face_name, face_material)
-            elif neighbor_pos not in self.grid:
+        else:
+            # Fallback: original dict-based path
+            grid = self.grid
+            full_blocks = self.full_blocks
+            for face_idx, (dx, dy, dz, face_name) in enumerate(FACE_DIRS):
+                neighbor_pos = (gx + dx, gy + dy, gz + dz)
+                if not always_show:
+                    if neighbor_pos in grid and full_blocks.get(neighbor_pos, False):
+                        continue
+                face_material = self.get_material_name(node_info, face_idx) if multi_tile else single_mat
                 self.emit_face(node_pos, face_name, face_material)
-            elif not self.full_blocks.get(neighbor_pos, False):
-                self.emit_face(node_pos, face_name, face_material)
+
+    # ------------------------------------------------------------------
+    # Flowing-liquid helpers
+    # ------------------------------------------------------------------
+
+    def _get_liquid_level(self, pos):
+        """
+        Classify any grid position by its liquid level.
+
+        Returns
+        -------
+        8    – source block (drawtype 'liquid')
+        0-7  – flowing block level encoded in param2 bits 0-2
+        -1   – solid / opaque block (blocks light spread)
+        None – air or position absent from the grid
+        """
+        node_info = self.grid.get(pos)
+        if node_info is None:
+            return None
+        node_def = self.node_defs.get(node_info.get('name', ''), {})
+        drawtype  = node_def.get('drawtype', 'normal')
+        if drawtype == 'liquid':
+            return 8
+        if drawtype == 'flowingliquid':
+            return (node_info.get('param2', 0) or 0) & 0x07
+        if drawtype == 'airlike':
+            return None
+        return -1  # any other solid block
+
+    def _get_liquid_corner_height(self, gx, gy, gz, dx, dz):
+        """
+        Interpolated surface height at one top corner, matching Luanti's
+        getCornerLevel algorithm (mapblock_mesh.cpp).
+
+        Parameters
+        ----------
+        dx, dz : 0 or 1
+            Which corner of the block along the x and z axes.
+
+        Returns
+        -------
+        float in [0.0, 1.0] where 1.0 == top of block.
+
+        Algorithm (mirrors Luanti source):
+          1. For each of the 4 grid cells sharing this corner:
+               a. If any liquid (source or flowing) exists at (pos.y+1) above
+                  that cell, return 1.0 immediately — liquid is pouring down.
+               b. Source block          → return 1.0 immediately.
+               c. Flowing block         → accumulate level for average.
+               d. Air or solid block    → skip (do NOT reduce corner height).
+                  Solid walls are excluded from the average; they don't pull
+                  the surface down.  This matches Luanti behaviour where water
+                  running along a wall stays at its natural level.
+          2. If any source was found → 1.0.
+          3. If any flowing blocks were found → (average_level + 0.5) / 8.
+          4. Fallback → 0 (shouldn't occur; the block itself is always included).
+        """
+        cx = 1 if dx == 1 else -1
+        cz = 1 if dz == 1 else -1
+        positions = [
+            (gx,      gy, gz     ),
+            (gx + cx, gy, gz     ),
+            (gx,      gy, gz + cz),
+            (gx + cx, gy, gz + cz),
+        ]
+        valid_levels = []
+        has_source   = False
+        for pos in positions:
+            # ── Check if liquid is present in the block directly above ──────
+            # If so, liquid is flowing downward into this corner → full height.
+            above_lv = self._get_liquid_level((pos[0], pos[1] + 1, pos[2]))
+            if above_lv is not None and above_lv != -1:
+                return 1.0
+
+            lv = self._get_liquid_level(pos)
+            if lv is None or lv == -1:
+                continue        # air or solid wall → skip, do not reduce height
+            if lv == 8:
+                has_source = True
+            else:
+                valid_levels.append(lv)
+
+        if has_source:
+            return 1.0
+        if valid_levels:
+            return min(1.0, (sum(valid_levels) / len(valid_levels) + 0.5) / 8.0)
+        return 0.0  # fallback; unreachable in practice since self is always counted
+
+    def emit_flowing_liquid(self, node_pos, material_name, node_info=None):
+        """
+        param2 encoding (Luanti source: mapnode.h):
+          bits 0-2  (& 0x07)  liquid level 0-7
+          bit  3    (& 0x08)  is_flowing_down — flat top at own level
+
+        Corner heights are interpolated from surrounding liquid levels to
+        produce sloped surfaces.  Side face v-coordinates are scaled to the
+        corner heights (texture clipped, not stretched).
+
+        Face index → tile index follows FACE_DIRS order:
+          0 top, 1 bottom, 2 east(+x), 3 west(-x), 4 south(+z), 5 north(-z)
+        """
+        gx, gy, gz     = node_pos
+        param2         = (node_info.get('param2', 0) or 0) if node_info else 0
+        is_flowing_down = bool(param2 & 0x08)
+        level           = param2 & 0x07
+
+        # ── Per-face material lookup ──────────────────────────────────────────
+        if node_info is not None:
+            tiles      = self.node_defs.get(node_info['name'], {}).get('tiles', [])
+            multi_tile = len(tiles) > 1
+            def face_mat(fi):
+                return self.get_material_name(node_info, fi) if multi_tile else material_name
+        else:
+            def face_mat(_fi):
+                return material_name
+
+        # ── Neighbour-solid test ───────────────────────────────────────────────
+        # Uses _liquid_solid_arr (solid blocks + all liquid) so that:
+        #   flowing → solid block       : face culled
+        #   flowing → source liquid     : face culled  (no barrier at transition)
+        #   flowing → flowing liquid    : face culled  (no interior duplicate faces)
+        #   flowing → air / other       : face shown 
+        liq_solid = self._liquid_solid_arr
+        if liq_solid is not None:
+            ox, oy, oz = self._arr_offset
+            sx, sy, sz = self._arr_shape
+            def should_show(nx, ny, nz):
+                nix, niy, niz = nx - ox, ny - oy, nz - oz
+                if not (0 <= nix < sx and 0 <= niy < sy and 0 <= niz < sz):
+                    return True     # out of bounds → exposed face
+                return not liq_solid[nix, niy, niz]
+        else:
+            grid        = self.grid
+            full_blocks = self.full_blocks
+            def should_show(nx, ny, nz):
+                pos = (nx, ny, nz)
+                if pos not in grid:
+                    return True
+                node_def = self.node_defs.get(grid[pos].get('name', ''), {})
+                dt = node_def.get('drawtype', 'normal')
+                # cull toward any liquid or any full solid block
+                if dt in ('liquid', 'flowingliquid'):
+                    return False
+                return not full_blocks.get(pos, False)
+
+        # ── Corner heights ────────────────────────────────────────────────────
+        if is_flowing_down:
+            # Check if liquid is present directly above — if so the column is
+            # continuous and the top must be flush at 1.0, not (level+0.5)/8.
+            above_lv = self._get_liquid_level((gx, gy + 1, gz))
+            if above_lv is not None and above_lv != -1:
+                h00 = h10 = h01 = h11 = 1.0
+            else:
+                h = min(1.0, (level + 0.5) / 8.0)
+                h00 = h10 = h01 = h11 = h
+        else:
+            # Interpolated corner heights; dx/dz = 0 → -x/-z corner, 1 → +x/+z
+            h00 = self._get_liquid_corner_height(gx, gy, gz, 0, 0)  # x=0, z=0
+            h10 = self._get_liquid_corner_height(gx, gy, gz, 1, 0)  # x=1, z=0
+            h01 = self._get_liquid_corner_height(gx, gy, gz, 0, 1)  # x=0, z=1
+            h11 = self._get_liquid_corner_height(gx, gy, gz, 1, 1)  # x=1, z=1
+
+        # ── Top face (face index 0) ───────────────────────────────────────────
+        # Vertices ordered to match FACE_QUADS['top']: (0,_,0),(0,_,1),(1,_,1),(1,_,0)
+        if should_show(gx, gy + 1, gz):
+            top_quad = [(0, h00, 0), (0, h01, 1), (1, h11, 1), (1, h10, 0)]
+            self.emit_quad(node_pos, top_quad, (0, 1, 0),
+                           face_mat(0), FACE_UVS['top'])
+
+        # ── Bottom face (face index 1) ────────────────────────────────────────
+        if should_show(gx, gy - 1, gz):
+            self.emit_quad(node_pos, FACE_QUADS['bottom'],
+                           (0, -1, 0), face_mat(1), FACE_UVS['bottom'])
+
+        # ── East face +x (face index 2) ──────────────────────────────────────
+        # Top edge: h10 at z=0, h11 at z=1.  UV v=0 at bottom → v=h at top.
+        if should_show(gx + 1, gy, gz):
+            eq = [(1, 0, 0), (1, h10, 0), (1, h11, 1), (1, 0, 1)]
+            self.emit_quad(node_pos, eq, (1, 0, 0), face_mat(2),
+                           [(0, 0), (0, h10), (1, h11), (1, 0)])
+
+        # ── West face -x (face index 3) ──────────────────────────────────────
+        # Top edge: h01 at z=1, h00 at z=0.  FACE_UVS['west'] has v=1 at bottom,
+        # v=0 at top so we invert: bottom v=1, top v=1-h.
+        if should_show(gx - 1, gy, gz):
+            wq = [(0, 0, 1), (0, h01, 1), (0, h00, 0), (0, 0, 0)]
+            self.emit_quad(node_pos, wq, (-1, 0, 0), face_mat(3),
+                           [(1, 1), (1, 1 - h01), (0, 1 - h00), (0, 1)])
+
+        # ── South face +z (face index 4) ─────────────────────────────────────
+        # Top edge: h01 at x=0, h11 at x=1.  UV v=0 at bottom → v=h at top.
+        if should_show(gx, gy, gz + 1):
+            sq = [(0, 0, 1), (1, 0, 1), (1, h11, 1), (0, h01, 1)]
+            self.emit_quad(node_pos, sq, (0, 0, 1), face_mat(4),
+                           [(0, 0), (1, 0), (1, h11), (0, h01)])
+
+        # ── North face -z (face index 5) ─────────────────────────────────────
+        # Top edge: h10 at x=1, h00 at x=0.  UV v=0 at bottom → v=h at top.
+        if should_show(gx, gy, gz - 1):
+            nq = [(1, 0, 0), (0, 0, 0), (0, h00, 0), (1, h10, 0)]
+            self.emit_quad(node_pos, nq, (0, 0, -1), face_mat(5),
+                           [(1, 0), (0, 0), (0, h00), (1, h10)])
 
     def _load_obj_file(self, obj_path):
         vertices = []
@@ -971,52 +1230,213 @@ class MeshExporter:
         return planes
 
     def generate_mesh(self, min_node, max_node):
-        min_x, min_y, min_z = min_node
-        max_x, max_y, max_z = max_node
+        import numpy as np
+
         total_nodes = len(self.grid)
-        processed = 0
-
         print(f"\nGenerating mesh from {total_nodes} nodes...")
+        if not self.grid:
+            return
 
-        for (gx, gy, gz), node_info in self.grid.items():
+        # ── Build world-space bounding box ────────────────────────────────────
+        all_pos = list(self.grid.keys())
+        min_gx = min(p[0] for p in all_pos); max_gx = max(p[0] for p in all_pos)
+        min_gy = min(p[1] for p in all_pos); max_gy = max(p[1] for p in all_pos)
+        min_gz = min(p[2] for p in all_pos); max_gz = max(p[2] for p in all_pos)
+        ox = min_gx - 1; oy = min_gy - 1; oz = min_gz - 1
+        shape = (max_gx - ox + 2, max_gy - oy + 2, max_gz - oz + 2)
+        self._arr_offset = (ox, oy, oz)
+        self._arr_shape  = shape
+
+        # ── Build solid-block array ───────────────────────────────────────────
+        solid_arr = np.zeros(shape, dtype=np.bool_)
+        for pos, is_full in self.full_blocks.items():
+            if is_full:
+                solid_arr[pos[0]-ox, pos[1]-oy, pos[2]-oz] = True
+        self._solid_arr = solid_arr
+
+        # ── Build liquid-solid array (solid + any liquid) ─────────────────────
+        # Used exclusively by liquid blocks so they cull faces at liquid–liquid
+        # and liquid–solid boundaries without leaking into normal-block culling.
+        liquid_solid_arr = solid_arr.copy()
+        for pos, node_info in self.grid.items():
+            node_def = self.node_defs.get(node_info.get('name', ''), {})
+            dt = node_def.get('drawtype', 'normal')
+            if dt == 'flowingliquid':
+                liquid_solid_arr[pos[0]-ox, pos[1]-oy, pos[2]-oz] = True
+        self._liquid_solid_arr = liquid_solid_arr
+
+        # ── Build vertex-index array ──────────────────────────────────────────
+        vert_arr = np.zeros(shape, dtype=np.int32)
+        self._vert_arr = vert_arr
+
+        # ── Pre-register UVs and normals for all 6 cube face orientations ─────
+        face_uv_idx   = {}
+        face_norm_idx = {}
+        for dx, dy, dz, face_name in FACE_DIRS:
+            face_uv_idx[face_name]   = tuple(
+                self.get_texcoord_index(uv) for uv in FACE_UVS[face_name]
+            )
+            face_norm_idx[face_name] = self.get_norm_index(FACE_NORMALS[face_name])
+
+        # ── Classify nodes into fast / slow paths ─────────────────────────────
+        ALWAYS_SHOW_DT = frozenset((
+            'glasslike', 'allfaces', 'allfaces_optional',
+            'glasslike_framed', 'glasslike_framed_optional',
+        ))
+
+        fast_cull   = {}   # mat -> [(x,y,z), ...] normal single-tile, needs culling
+        fast_always = {}   # mat -> [(x,y,z), ...] glasslike single-tile, always emit
+        slow_nodes  = []   # (pos, node_info, node_def, drawtype)
+
+        processed = 0
+        for pos, node_info in self.grid.items():
             processed += 1
-            if processed % 100000 == 0:
-                print(f"  Processing nodes: {processed * 100 // total_nodes}%", end='\r')
+            if processed % 200_000 == 0:
+                print(f"  Classifying: {processed * 100 // total_nodes}%", end='\r')
 
             node_name = node_info['name']
-            node_def = self.node_defs.get(node_name, {})
-            drawtype = node_def.get('drawtype', 'normal')
-            material_name = self.get_material_name(node_info)
+            node_def  = self.node_defs.get(node_name, {})
+            drawtype  = node_def.get('drawtype', 'normal')
 
             if drawtype == 'airlike':
                 continue
 
+            if drawtype == 'normal' or drawtype in ALWAYS_SHOW_DT:
+                tiles = node_def.get('tiles', [])
+                if len(tiles) <= 1:
+                    mat    = self.get_material_name(node_info, 0)
+                    bucket = fast_always if drawtype in ALWAYS_SHOW_DT else fast_cull
+                    bucket.setdefault(mat, []).append(pos)
+                    continue
+
+            slow_nodes.append((pos, node_info, node_def, drawtype))
+
+        n_fast = (sum(len(v) for v in fast_cull.values())
+                  + sum(len(v) for v in fast_always.values()))
+        print(f"  Fast path: {n_fast} nodes  |  Slow path: {len(slow_nodes)} nodes")
+
+        # ── Vectorized fast path ──────────────────────────────────────────────
+        def _emit_cube_batch(mat_to_pos, always_show):
+            for mat, positions in mat_to_pos.items():
+                pos_arr = np.array(positions, dtype=np.int32)  # (N, 3)
+                aix = pos_arr[:, 0] - ox
+                aiy = pos_arr[:, 1] - oy
+                aiz = pos_arr[:, 2] - oz
+
+                face_list = self.material_faces[mat]
+                verts     = self.vertices
+
+                for dx, dy, dz, face_name in FACE_DIRS:
+                    if always_show:
+                        mask = np.ones(len(pos_arr), dtype=np.bool_)
+                    else:
+                        nix = aix + dx
+                        niy = aiy + dy
+                        niz = aiz + dz
+                        in_bounds = (
+                            (nix >= 0) & (nix < shape[0]) &
+                            (niy >= 0) & (niy < shape[1]) &
+                            (niz >= 0) & (niz < shape[2])
+                        )
+                        is_solid = np.zeros(len(pos_arr), dtype=np.bool_)
+                        if in_bounds.any():
+                            is_solid[in_bounds] = solid_arr[
+                                nix[in_bounds], niy[in_bounds], niz[in_bounds]
+                            ]
+                        mask = ~is_solid
+
+                    if not mask.any():
+                        continue
+
+                    eaix = aix[mask]
+                    eaiy = aiy[mask]
+                    eaiz = aiz[mask]
+
+                    quad            = FACE_QUADS[face_name]
+                    ui0,ui1,ui2,ui3 = face_uv_idx[face_name]
+                    ni              = face_norm_idx[face_name]
+                    s0 = f'/{ui0}/{ni} '
+                    s1 = f'/{ui1}/{ni} '
+                    s2 = f'/{ui2}/{ni} '
+                    s3 = f'/{ui3}/{ni}'
+
+                    vert_idxs = []
+                    for vx, vy, vz in quad:
+                        vix = eaix + vx
+                        viy = eaiy + vy
+                        viz = eaiz + vz
+
+                        raw       = vert_arr[vix, viy, viz]
+                        zero_mask = raw == 0
+
+                        if zero_mask.any():
+                            new_stack = np.stack(
+                                [vix[zero_mask], viy[zero_mask], viz[zero_mask]], axis=1
+                            )
+                            unique_new, inverse = np.unique(
+                                new_stack, axis=0, return_inverse=True
+                            )
+                            n_new  = len(unique_new)
+                            start  = len(verts) + 1
+                            new_vi = np.arange(start, start + n_new, dtype=np.int32)
+                            vert_arr[
+                                unique_new[:, 0],
+                                unique_new[:, 1],
+                                unique_new[:, 2],
+                            ] = new_vi
+                            for ux, uy, uz in unique_new:
+                                verts.append((int(ux)+ox, int(uy)+oy, int(uz)+oz))
+                            raw = vert_arr[vix, viy, viz]
+
+                        vert_idxs.append(raw)
+
+                    vi0_l = vert_idxs[0].tolist()
+                    vi1_l = vert_idxs[1].tolist()
+                    vi2_l = vert_idxs[2].tolist()
+                    vi3_l = vert_idxs[3].tolist()
+                    face_list.extend(
+                        f'{a}{s0}{b}{s1}{c}{s2}{d}{s3}'
+                        for a, b, c, d in zip(vi0_l, vi1_l, vi2_l, vi3_l)
+                    )
+
+        _emit_cube_batch(fast_cull,   always_show=False)
+        _emit_cube_batch(fast_always, always_show=True)
+
+        # ── Slow path ─────────────────────────────────────────────────────────
+        total_slow = len(slow_nodes)
+        if total_slow:
+            print(f"  Slow path processing...")
+        for idx_s, (pos, node_info, node_def, drawtype) in enumerate(slow_nodes):
+            if idx_s % 50_000 == 0 and idx_s:
+                print(f"  Slow path: {idx_s * 100 // total_slow}%", end='\r')
+
+            gx, gy, gz    = pos
+            material_name = self.get_material_name(node_info)
+
             if drawtype == 'mesh':
                 mesh_name = node_def.get('mesh')
-                param2 = node_info.get('param2', 0) or 0
+                param2    = node_info.get('param2', 0) or 0
                 mesh_path = self._find_mesh_file(mesh_name)
                 if mesh_path:
-                    self.emit_mesh_obj((gx, gy, gz), mesh_path, node_name, node_def, param2)
+                    self.emit_mesh_obj(pos, mesh_path, node_info['name'], node_def, param2)
                 else:
-                    self.emit_node_cube((gx, gy, gz), material_name, 'normal',
-                                       min_node, max_node, node_info=node_info)
+                    self.emit_node_cube(pos, material_name, 'normal',
+                                        min_node, max_node, node_info=node_info)
                 continue
 
             if drawtype == 'nodebox':
-                param2 = node_info.get('param2', 0) or 0
+                param2     = node_info.get('param2', 0) or 0
                 paramtype2 = node_def.get('paramtype2', '')
                 if paramtype2 != 'facedir':
                     param2 = 0
-                boxes = self._parse_nodeboxes(node_def)
-                for box in boxes:
-                    self.emit_box((gx, gy, gz), box, material_name, param2, node_info=node_info)
+                for box in self._parse_nodeboxes(node_def):
+                    self.emit_box(pos, box, material_name, param2, node_info=node_info)
                 continue
 
             if drawtype in ('plantlike', 'plantlike_rooted'):
-                param2 = node_info.get('param2', 0) or 0
+                param2     = node_info.get('param2', 0) or 0
                 paramtype2 = node_def.get('paramtype2', '')
-                planes = self._get_plantlike_planes(param2, paramtype2)
-                for plane_verts in planes:
+                for plane_verts in self._get_plantlike_planes(param2, paramtype2):
                     e1 = (plane_verts[1][0]-plane_verts[0][0],
                           plane_verts[1][1]-plane_verts[0][1],
                           plane_verts[1][2]-plane_verts[0][2])
@@ -1027,47 +1447,42 @@ class MeshExporter:
                     ny_c = e1[2]*e2[0] - e1[0]*e2[2]
                     nz_c = e1[0]*e2[1] - e1[1]*e2[0]
                     length = (nx_c*nx_c + ny_c*ny_c + nz_c*nz_c) ** 0.5
-                    if length > 0:
-                        normal = (nx_c/length, ny_c/length, nz_c/length)
-                    else:
-                        normal = (0, 1, 0)
-                    self.emit_quad((gx, gy, gz), plane_verts, normal, material_name)
+                    normal = (nx_c/length, ny_c/length, nz_c/length) if length > 0 else (0, 1, 0)
+                    self.emit_quad(pos, plane_verts, normal, material_name)
                 continue
 
             if drawtype == 'torchlike':
                 param2 = node_info.get('param2', 0) or 0
                 if param2 == 0:
                     planes = [
-                        [(-0.1, -0.5, 0), (0.1, -0.5, 0), (0.1, 0.3, 0), (-0.1, 0.3, 0)],
-                        [(0, -0.5, -0.1), (0, -0.5, 0.1), (0, 0.3, 0.1), (0, 0.3, -0.1)],
+                        [(-0.1,-0.5,0),(0.1,-0.5,0),(0.1,0.3,0),(-0.1,0.3,0)],
+                        [(0,-0.5,-0.1),(0,-0.5,0.1),(0,0.3,0.1),(0,0.3,-0.1)],
                     ]
                 elif param2 == 1:
                     planes = [
-                        [(-0.1, -0.3, 0), (0.1, -0.3, 0), (0.1, 0.5, 0), (-0.1, 0.5, 0)],
-                        [(0, -0.3, -0.1), (0, -0.3, 0.1), (0, 0.5, 0.1), (0, 0.5, -0.1)],
+                        [(-0.1,-0.3,0),(0.1,-0.3,0),(0.1,0.5,0),(-0.1,0.5,0)],
+                        [(0,-0.3,-0.1),(0,-0.3,0.1),(0,0.5,0.1),(0,0.5,-0.1)],
                     ]
                 else:
-                    planes = [
-                        [(-0.3, -0.1, 0), (0.3, -0.1, 0), (0.3, 0.1, 0), (-0.3, 0.1, 0)],
-                    ]
+                    planes = [[(-0.3,-0.1,0),(0.3,-0.1,0),(0.3,0.1,0),(-0.3,0.1,0)]]
                 for plane_verts in planes:
-                    self.emit_quad((gx, gy, gz), plane_verts, (0, 1, 0), material_name)
+                    self.emit_quad(pos, plane_verts, (0, 1, 0), material_name)
                 continue
 
             if drawtype == 'signlike':
-                planes = [
-                    [(-0.5, -0.5, 0.4), (0.5, -0.5, 0.4), (0.5, 0.5, 0.4), (-0.5, 0.5, 0.4)],
-                ]
-                for plane_verts in planes:
-                    self.emit_quad((gx, gy, gz), plane_verts, (0, 0, 1), material_name)
+                self.emit_quad(
+                    pos,
+                    [(-0.5,-0.5,0.4),(0.5,-0.5,0.4),(0.5,0.5,0.4),(-0.5,0.5,0.4)],
+                    (0, 0, 1), material_name,
+                )
                 continue
 
             if drawtype == 'firelike':
                 planes = [
-                    [(-0.5, -0.5, -0.1), (0.5, -0.5, 0.1), (0.5, 0.5, 0.1), (-0.5, 0.5, -0.1)],
-                    [(-0.5, -0.5, 0.1), (0.5, -0.5, -0.1), (0.5, 0.5, -0.1), (-0.5, 0.5, 0.1)],
-                    [(-0.1, -0.5, -0.5), (0.1, -0.5, 0.5), (0.1, 0.5, 0.5), (-0.1, 0.5, -0.5)],
-                    [(-0.1, -0.5, 0.5), (0.1, -0.5, -0.5), (0.1, 0.5, -0.5), (-0.1, 0.5, 0.5)],
+                    [(-0.5,-0.5,-0.1),(0.5,-0.5,0.1),(0.5,0.5,0.1),(-0.5,0.5,-0.1)],
+                    [(-0.5,-0.5,0.1),(0.5,-0.5,-0.1),(0.5,0.5,-0.1),(-0.5,0.5,0.1)],
+                    [(-0.1,-0.5,-0.5),(0.1,-0.5,0.5),(0.1,0.5,0.5),(-0.1,0.5,-0.5)],
+                    [(-0.1,-0.5,0.5),(0.1,-0.5,-0.5),(0.1,0.5,-0.5),(-0.1,0.5,0.5)],
                 ]
                 for plane_verts in planes:
                     e1 = (plane_verts[1][0]-plane_verts[0][0],
@@ -1080,22 +1495,19 @@ class MeshExporter:
                     ny_c = e1[2]*e2[0] - e1[0]*e2[2]
                     nz_c = e1[0]*e2[1] - e1[1]*e2[0]
                     length = (nx_c*nx_c + ny_c*ny_c + nz_c*nz_c) ** 0.5
-                    if length > 0:
-                        normal = (nx_c/length, ny_c/length, nz_c/length)
-                    else:
-                        normal = (0, 1, 0)
-                    self.emit_quad((gx, gy, gz), plane_verts, normal, material_name)
+                    normal = (nx_c/length, ny_c/length, nz_c/length) if length > 0 else (0, 1, 0)
+                    self.emit_quad(pos, plane_verts, normal, material_name)
                 continue
 
-            if drawtype in ('liquid', 'flowingliquid'):
-                self.emit_node_cube((gx, gy, gz), material_name, drawtype,
-                                   min_node, max_node, node_info=node_info)
+            if drawtype == 'flowingliquid':
+                self.emit_flowing_liquid(pos, material_name, node_info=node_info)
                 continue
 
-            self.emit_node_cube((gx, gy, gz), material_name, drawtype,
-                               min_node, max_node, node_info=node_info)
+            # liquid, multi-tile normal, and any other cube-like drawtype
+            self.emit_node_cube(pos, material_name, drawtype,
+                                min_node, max_node, node_info=node_info)
 
-        print(f"  Processing nodes: 100%")
+        print(f"  Mesh generation complete.")
 
     def write_obj(self, output_path):
         obj_path = output_path.with_suffix('.obj')
@@ -1111,29 +1523,25 @@ class MeshExporter:
         print(f"  Faces:     {total_faces}")
         print(f"  Materials: {len(self.materials)}")
 
-        with open(obj_path, 'w') as f:
+        # Change 1: 1 MB write buffer + writelines generators instead of
+        # one f.write() per vertex/face (was 36M+ individual write syscalls).
+        with open(obj_path, 'w', buffering=1 << 20) as f:
             f.write("# Minetest map export\n")
             f.write(f"mtllib {mtl_name}\n\n")
 
-            for x, y, z in self.vertices:
-                f.write(f"v {x} {y} {z}\n")
-
+            f.writelines(f"v {x} {y} {z}\n" for x, y, z in self.vertices)
             f.write("\n")
-            for nx, ny, nz in self.normals:
-                f.write(f"vn {nx} {ny} {nz}\n")
-
+            f.writelines(f"vn {nx} {ny} {nz}\n" for nx, ny, nz in self.normals)
             f.write("\n")
-            for u, v in self.texcoords:
-                f.write(f"vt {u} {v}\n")
-
+            f.writelines(f"vt {u} {v}\n" for u, v in self.texcoords)
             f.write("\n")
+
             for mat_name, faces in self.material_faces.items():
                 if not faces:
                     continue
                 safe_name = self._safe_name_map.get(mat_name, re.sub(r'[^a-zA-Z0-9_]', '_', mat_name))
                 f.write(f"usemtl {safe_name}\n")
-                for face_str in faces:
-                    f.write(f"f {face_str}\n")
+                f.writelines(f"f {face_str}\n" for face_str in faces)
 
         return obj_path
 
@@ -1189,7 +1597,6 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Coordinate examples:
-  --min-node -993 -993 -993 --max-node 1007 1007 1007   (full world)
   --min-node 0 0 0 --max-node 255 127 255               (near origin, 16 mapblocks)
   --min-node -16 -16 -16 --max-node 31 31 31            (small test area)
 
@@ -1306,7 +1713,6 @@ The script generates:
         print(f"  {output_path.with_suffix('.v28_colors.txt')}")
     if exporter.material_textures:
         print(f"  textures/ ({len(exporter.material_textures)} textures resolved)")
-
 
 if __name__ == '__main__':
     main()
