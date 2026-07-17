@@ -833,39 +833,66 @@ class MeshExporter:
     # Flowing-liquid helpers
     # ------------------------------------------------------------------
 
-    def _get_liquid_level(self, pos):
+    def _liquid_identity(self, node_name, node_def):
         """
-        Classify any grid position by its liquid level.
+        Resolve which node names count as "the same liquid" as node_name, and
+        its level range, mirroring Luanti's cur_liquid.c_source / c_flowing /
+        liquid_range (content_mapblock.cpp prepareLiquidNodeDrawing).
+        """
+        drawtype = node_def.get('drawtype', 'normal')
+        source = node_def.get('liquid_alternative_source') or (
+            node_name if drawtype == 'liquid' else None)
+        flowing = node_def.get('liquid_alternative_flowing') or (
+            node_name if drawtype == 'flowingliquid' else None)
+        liquid_range = node_def.get('liquid_range', 8)
+        if not isinstance(liquid_range, int):
+            liquid_range = 8
+        liquid_range = max(1, min(8, liquid_range))
+        return source, flowing, liquid_range
 
-        Returns
-        -------
-        8    – source block (drawtype 'liquid')
-        0-7  – flowing block level encoded in param2 bits 0-2
-        -1   – solid / opaque block (blocks light spread)
-        None – air or position absent from the grid
+    def _classify_liquid_neighbor(self, pos, own_source, own_flowing, liquid_range):
+        """
+        Classify a grid position relative to a specific liquid's identity,
+        mirroring Luanti's getLiquidNeighborhood/getCornerLevel.
+
+        Returns (kind, height) where kind is one of:
+          'source'  – matches own_source, height 1.0
+          'flowing' – matches own_flowing, height normalized by liquid_range
+          'air'     – air or absent from the grid
+          'other'   – anything else (solid, or an unrelated/different liquid) —
+                      ignored entirely, same as Luanti ignores non-matching content.
         """
         node_info = self.grid.get(pos)
         if node_info is None:
-            return None
-        node_def = self.node_defs.get(node_info.get('name', ''), {})
-        drawtype  = node_def.get('drawtype', 'normal')
-        if drawtype == 'liquid':
-            return 8
-        if drawtype == 'flowingliquid':
-            return (node_info.get('param2', 0) or 0) & 0x07
-        if drawtype == 'airlike':
-            return None
-        return -1  # any other solid block
+            return ('air', None)
+        name = node_info.get('name', '')
+        node_def = self.node_defs.get(name, {})
+        if node_def.get('drawtype', 'normal') == 'airlike':
+            return ('air', None)
+        if own_source and name == own_source:
+            return ('source', 1.0)
+        if own_flowing and name == own_flowing:
+            raw = (node_info.get('param2', 0) or 0) & 0x07
+            thresh = 7 + 1 - liquid_range  # LIQUID_LEVEL_MAX+1-range
+            raw = 0 if raw <= thresh else raw - thresh
+            return ('flowing', min(1.0, (raw + 0.5) / liquid_range))
+        return ('other', None)
 
-    def _get_liquid_corner_height(self, gx, gy, gz, dx, dz):
+    def _get_liquid_corner_height(self, gx, gy, gz, dx, dz,
+                                   own_source, own_flowing, liquid_range):
         """
         Interpolated surface height at one top corner, matching Luanti's
-        getCornerLevel algorithm (mapblock_mesh.cpp).
+        getCornerLevel algorithm (content_mapblock.cpp).
 
         Parameters
         ----------
         dx, dz : 0 or 1
             Which corner of the block along the x and z axes.
+        own_source, own_flowing, liquid_range :
+            Identity of the liquid being rendered — only neighbors that are
+            this exact same liquid (same source/flowing node names) affect
+            the height; unrelated liquids (a different pool, lava, a
+            different modded fluid) are ignored, exactly like Luanti.
 
         Returns
         -------
@@ -873,17 +900,18 @@ class MeshExporter:
 
         Algorithm (mirrors Luanti source):
           1. For each of the 4 grid cells sharing this corner:
-               a. If any liquid (source or flowing) exists at (pos.y+1) above
-                  that cell, return 1.0 immediately — liquid is pouring down.
-               b. Source block          → return 1.0 immediately.
-               c. Flowing block         → accumulate level for average.
-               d. Air or solid block    → skip (do NOT reduce corner height).
-                  Solid walls are excluded from the average; they don't pull
-                  the surface down.  This matches Luanti behaviour where water
-                  running along a wall stays at its natural level.
-          2. If any source was found → 1.0.
-          3. If any flowing blocks were found → (average_level + 0.5) / 8.
-          4. Fallback → 0 (shouldn't occur; the block itself is always included).
+               a. If the same liquid (source or flowing) exists at (pos.y+1)
+                  above that cell, return 1.0 immediately — liquid pouring down.
+               b. Source of the same liquid  → return 1.0 immediately.
+               c. Flowing, same liquid       → accumulate level for average.
+               d. Air                        → count toward the tapering check.
+               e. Anything else (solid, or a different/unrelated liquid)
+                  → ignored entirely.
+          2. If 2+ of the 4 cells were air → corner collapses near the block
+             floor (matches Luanti's -0.5 + 0.2/BS edge taper).
+          3. Else if any flowing cells were found → their average.
+          4. Fallback → 0.5 (unreachable in practice; the node itself is
+             always one of the 4 cells and is always source or flowing).
         """
         cx = 1 if dx == 1 else -1
         cz = 1 if dz == 1 else -1
@@ -893,50 +921,57 @@ class MeshExporter:
             (gx,      gy, gz + cz),
             (gx + cx, gy, gz + cz),
         ]
-        valid_levels = []
-        has_source   = False
+        total = 0.0
+        count = 0
+        air_count = 0
         for pos in positions:
-            # ── Check if liquid is present in the block directly above ──────
-            # If so, liquid is flowing downward into this corner → full height.
-            above_lv = self._get_liquid_level((pos[0], pos[1] + 1, pos[2]))
-            if above_lv is not None and above_lv != -1:
+            above_kind, _ = self._classify_liquid_neighbor(
+                (pos[0], pos[1] + 1, pos[2]), own_source, own_flowing, liquid_range)
+            if above_kind in ('source', 'flowing'):
                 return 1.0
 
-            lv = self._get_liquid_level(pos)
-            if lv is None or lv == -1:
-                continue        # air or solid wall → skip, do not reduce height
-            if lv == 8:
-                has_source = True
-            else:
-                valid_levels.append(lv)
+            kind, level = self._classify_liquid_neighbor(
+                pos, own_source, own_flowing, liquid_range)
+            if kind == 'source':
+                return 1.0
+            elif kind == 'flowing':
+                total += level
+                count += 1
+            elif kind == 'air':
+                air_count += 1
+            # 'other' (solid or an unrelated liquid): ignored, same as Luanti
 
-        if has_source:
-            return 1.0
-        if valid_levels:
-            return min(1.0, (sum(valid_levels) / len(valid_levels) + 0.5) / 8.0)
-        return 0.0  # fallback; unreachable in practice since self is always counted
+        if air_count >= 2:
+            return 0.02  # matches Luanti's near-floor collapse (-0.5 + 0.2/BS)
+        if count > 0:
+            return total / count
+        return 0.5  # unreachable in practice; self is always counted
 
     def emit_flowing_liquid(self, node_pos, material_name, node_info=None):
         """
-        param2 encoding (Luanti source: mapnode.h):
-          bits 0-2  (& 0x07)  liquid level 0-7
-          bit  3    (& 0x08)  is_flowing_down — flat top at own level
+        param2 bits 0-2 (& 0x07) hold the flowing liquid's level (normalized
+        by the node's own liquid_range). Corner heights are interpolated from
+        surrounding same-liquid levels via _get_liquid_corner_height, which
+        mirrors Luanti's getCornerLevel (content_mapblock.cpp) — including its
+        "liquid above = full height" and "2+ air neighbors = taper to floor"
+        behaviour. There is no separate "flowing down" special case: Luanti's
+        mesh generator gets that behaviour for free from the uniform per-corner
+        algorithm, so this exporter does the same.
 
-        Corner heights are interpolated from surrounding liquid levels to
-        produce sloped surfaces.  Side face v-coordinates are scaled to the
-        corner heights (texture clipped, not stretched).
+        Side face v-coordinates are scaled to the corner heights (texture
+        clipped, not stretched).
 
         Face index → tile index follows FACE_DIRS order:
           0 top, 1 bottom, 2 east(+x), 3 west(-x), 4 south(+z), 5 north(-z)
         """
-        gx, gy, gz     = node_pos
-        param2         = (node_info.get('param2', 0) or 0) if node_info else 0
-        is_flowing_down = bool(param2 & 0x08)
-        level           = param2 & 0x07
+        gx, gy, gz = node_pos
+        node_def = self.node_defs.get(node_info['name'], {}) if node_info else {}
+        own_source, own_flowing, liquid_range = self._liquid_identity(
+            node_info['name'] if node_info else '', node_def)
 
         # ── Per-face material lookup ──────────────────────────────────────────
         if node_info is not None:
-            tiles      = self.node_defs.get(node_info['name'], {}).get('tiles', [])
+            tiles      = node_def.get('tiles', [])
             multi_tile = len(tiles) > 1
             def face_mat(fi):
                 return self.get_material_name(node_info, fi) if multi_tile else material_name
@@ -974,21 +1009,14 @@ class MeshExporter:
                 return not full_blocks.get(pos, False)
 
         # ── Corner heights ────────────────────────────────────────────────────
-        if is_flowing_down:
-            # Check if liquid is present directly above — if so the column is
-            # continuous and the top must be flush at 1.0, not (level+0.5)/8.
-            above_lv = self._get_liquid_level((gx, gy + 1, gz))
-            if above_lv is not None and above_lv != -1:
-                h00 = h10 = h01 = h11 = 1.0
-            else:
-                h = min(1.0, (level + 0.5) / 8.0)
-                h00 = h10 = h01 = h11 = h
-        else:
-            # Interpolated corner heights; dx/dz = 0 → -x/-z corner, 1 → +x/+z
-            h00 = self._get_liquid_corner_height(gx, gy, gz, 0, 0)  # x=0, z=0
-            h10 = self._get_liquid_corner_height(gx, gy, gz, 1, 0)  # x=1, z=0
-            h01 = self._get_liquid_corner_height(gx, gy, gz, 0, 1)  # x=0, z=1
-            h11 = self._get_liquid_corner_height(gx, gy, gz, 1, 1)  # x=1, z=1
+        # Interpolated corner heights; dx/dz = 0 → -x/-z corner, 1 → +x/+z.
+        # Only neighbors that are this same liquid (own_source/own_flowing)
+        # contribute — see _get_liquid_corner_height / _classify_liquid_neighbor.
+        args = (own_source, own_flowing, liquid_range)
+        h00 = self._get_liquid_corner_height(gx, gy, gz, 0, 0, *args)  # x=0, z=0
+        h10 = self._get_liquid_corner_height(gx, gy, gz, 1, 0, *args)  # x=1, z=0
+        h01 = self._get_liquid_corner_height(gx, gy, gz, 0, 1, *args)  # x=0, z=1
+        h11 = self._get_liquid_corner_height(gx, gy, gz, 1, 1, *args)  # x=1, z=1
 
         # ── Top face (face index 0) ───────────────────────────────────────────
         # Vertices ordered to match FACE_QUADS['top']: (0,_,0),(0,_,1),(1,_,1),(1,_,0)
